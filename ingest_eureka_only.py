@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Ingest Eureka Network grants into production PostgreSQL + Pinecone.
-Simplified version that only handles Eureka Network data.
+Ingest Eureka Network grants into MongoDB + Pinecone.
+Converts scraped grant data to MongoDB document format with OpenAI embeddings.
 """
 
 import json
@@ -9,10 +9,10 @@ import os
 import sys
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
-import psycopg2
 import openai
+from pymongo import MongoClient
 from pinecone import Pinecone
 from tqdm import tqdm
 from dotenv import load_dotenv
@@ -24,11 +24,12 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "ailsa-grants")
-DATABASE_URL = os.getenv("DATABASE_URL")
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "ailsa_grants")
 
-if not all([OPENAI_API_KEY, PINECONE_API_KEY, DATABASE_URL]):
-    print("❌ Missing required environment variables!")
-    print("   Required: OPENAI_API_KEY, PINECONE_API_KEY, DATABASE_URL")
+if not all([OPENAI_API_KEY, PINECONE_API_KEY, MONGO_URI]):
+    print("Missing required environment variables!")
+    print("   Required: OPENAI_API_KEY, PINECONE_API_KEY, MONGO_URI")
     sys.exit(1)
 
 openai.api_key = OPENAI_API_KEY
@@ -36,7 +37,8 @@ openai.api_key = OPENAI_API_KEY
 # Initialize clients
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(PINECONE_INDEX_NAME)
-pg_conn = psycopg2.connect(DATABASE_URL)
+mongo_client = MongoClient(MONGO_URI)
+db = mongo_client[MONGO_DB_NAME]
 
 
 def load_eureka_grants() -> List[Dict[str, Any]]:
@@ -44,67 +46,191 @@ def load_eureka_grants() -> List[Dict[str, Any]]:
     file_path = Path("data/eureka_network/normalized.json")
 
     if not file_path.exists():
-        print(f"❌ File not found: {file_path}")
+        print(f"File not found: {file_path}")
         print(f"   Run scraper first: python eureka_scraper.py")
         return []
 
     grants = json.loads(file_path.read_text(encoding='utf-8'))
-    print(f"📁 Loaded {len(grants)} grants from Eureka Network")
+    print(f"Loaded {len(grants)} grants from Eureka Network")
     return grants
 
 
-def extract_embedding_text(grant: Dict[str, Any]) -> str:
-    """Extract rich text for embedding from Eureka grant using structured sections"""
+def extract_sectors(grant: Dict[str, Any]) -> List[str]:
+    """Extract sectors/categories from grant data if available."""
+    sectors = []
+    raw = grant.get('raw', {})
+    sections = raw.get('sections', {})
+
+    # Try to extract from eligibility or about sections
+    about = sections.get('about', '') or sections.get('description', '')
+    eligibility = sections.get('eligibility', '')
+
+    # Common sector keywords to look for
+    sector_keywords = {
+        'technology': ['technology', 'tech', 'digital', 'software', 'hardware'],
+        'healthcare': ['health', 'medical', 'biotech', 'pharma', 'life sciences'],
+        'energy': ['energy', 'renewable', 'clean tech', 'sustainability'],
+        'manufacturing': ['manufacturing', 'industrial', 'production'],
+        'aerospace': ['aerospace', 'aviation', 'space'],
+        'automotive': ['automotive', 'vehicle', 'mobility'],
+        'agriculture': ['agriculture', 'agri', 'food', 'agtech'],
+        'environment': ['environment', 'climate', 'green'],
+    }
+
+    text_to_search = f"{about} {eligibility}".lower()
+
+    for sector, keywords in sector_keywords.items():
+        if any(kw in text_to_search for kw in keywords):
+            sectors.append(sector)
+
+    return sectors
+
+
+def normalize_eureka_grant(grant: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize Eureka grant to MongoDB document schema.
+
+    Follows the schema specified in SPEC 2 for consistent grant storage.
+    """
+    raw = grant.get('raw', {})
+    sections = raw.get('sections', {})
+
+    # Get description from various possible sources
+    description = raw.get('description', '') or sections.get('about', '') or sections.get('description', '')
+
+    # Parse dates to datetime objects if they're strings
+    open_date = grant.get('open_date')
+    close_date = grant.get('close_date')
+
+    if isinstance(open_date, str) and open_date:
+        try:
+            open_date = datetime.fromisoformat(open_date.replace('Z', '+00:00'))
+        except ValueError:
+            open_date = None
+
+    if isinstance(close_date, str) and close_date:
+        try:
+            close_date = datetime.fromisoformat(close_date.replace('Z', '+00:00'))
+        except ValueError:
+            close_date = None
+
+    # Determine status
+    status = grant.get('status', 'Unknown').lower()
+    if status not in ['open', 'closed', 'upcoming']:
+        status = 'unknown'
+
+    # Build programme tag
+    programme = grant.get('programme', '')
+    programme_tag = programme.lower().replace(' ', '_') if programme else ''
+
+    # Build tags list
+    tags = ['eureka']
+    if programme_tag:
+        tags.append(programme_tag)
+    if grant.get('is_supplemental'):
+        tags.append('investment_readiness')
+
+    # Extract sectors
+    sectors = extract_sectors(grant)
+
+    now = datetime.utcnow()
+
+    return {
+        # Primary identifiers
+        "grant_id": f"eureka_{grant.get('call_id', grant['id'].split(':')[-1])}",
+        "source": "eureka",
+        "external_id": grant.get('call_id', grant['id'].split(':')[-1]),
+
+        # Core metadata
+        "title": grant['title'],
+        "url": grant['url'],
+        "description": description[:2000] if description else "",
+
+        # Status & dates
+        "status": status,
+        "is_active": status == "open",
+        "opens_at": open_date,
+        "closes_at": close_date,
+
+        # Funding
+        "total_fund_gbp": None,  # Eureka often doesn't specify total pot
+        "total_fund_display": raw.get('funding_info'),
+        "project_funding_min": None,
+        "project_funding_max": None,
+        "competition_type": "grant",
+
+        # Programme info
+        "programme": programme,
+
+        # Classification
+        "tags": tags,
+        "sectors": sectors,
+
+        # Raw data (Eureka has less structured data, keep more for re-parsing)
+        "raw": {
+            "description": raw.get('description'),
+            "funding_info": raw.get('funding_info'),
+            "sections": sections,
+            "is_supplemental": grant.get('is_supplemental', False),
+            "original_id": grant['id'],
+            "original_source": grant['source'],
+        },
+
+        # Timestamps
+        "scraped_at": now,
+        "updated_at": now,
+    }
+
+
+def extract_embedding_text(grant_doc: Dict[str, Any]) -> str:
+    """Extract rich text for embedding from normalized grant document."""
     parts = []
 
     # Title
-    if grant.get('title'):
-        parts.append(f"Title: {grant['title']}")
+    if grant_doc.get('title'):
+        parts.append(f"Title: {grant_doc['title']}")
 
     # Programme
-    if grant.get('programme'):
-        parts.append(f"Programme: {grant['programme']}")
+    if grant_doc.get('programme'):
+        parts.append(f"Programme: {grant_doc['programme']}")
 
     # Source
     parts.append("Source: Eureka Network")
 
-    # Supplemental flag
-    if grant.get('is_supplemental'):
+    # Type
+    raw = grant_doc.get('raw', {})
+    if raw.get('is_supplemental'):
         parts.append("Type: Investment Readiness (Supplemental)")
     else:
         parts.append("Type: R&D Grant")
 
     # Status and dates
-    if grant.get('status'):
-        parts.append(f"Status: {grant['status']}")
+    if grant_doc.get('status'):
+        parts.append(f"Status: {grant_doc['status']}")
 
-    if grant.get('open_date'):
-        parts.append(f"Opens: {grant['open_date']}")
+    if grant_doc.get('opens_at'):
+        parts.append(f"Opens: {grant_doc['opens_at'].isoformat() if isinstance(grant_doc['opens_at'], datetime) else grant_doc['opens_at']}")
 
-    if grant.get('close_date'):
-        parts.append(f"Deadline: {grant['close_date']}")
+    if grant_doc.get('closes_at'):
+        parts.append(f"Deadline: {grant_doc['closes_at'].isoformat() if isinstance(grant_doc['closes_at'], datetime) else grant_doc['closes_at']}")
 
-    # Extract from structured sections
-    raw = grant.get('raw', {})
+    # Description
+    if grant_doc.get('description'):
+        desc_text = grant_doc['description'][:1000]
+        parts.append(f"\nDescription:\n{desc_text}")
+
+    # Extract from raw sections
     sections = raw.get('sections', {})
 
-    # About/Description
+    # About section (if different from description)
     if sections.get('about'):
-        about_text = sections['about']
-        if len(about_text) > 1000:
-            about_text = about_text[:900] + "..."
-        parts.append(f"\nAbout:\n{about_text}")
-    elif sections.get('description'):
-        desc_text = sections['description']
-        if len(desc_text) > 1000:
-            desc_text = desc_text[:900] + "..."
-        parts.append(f"\nDescription:\n{desc_text}")
+        about_text = sections['about'][:900]
+        if about_text not in grant_doc.get('description', ''):
+            parts.append(f"\nAbout:\n{about_text}")
 
     # Eligibility
     if sections.get('eligibility'):
-        eligibility_text = sections['eligibility']
-        if len(eligibility_text) > 800:
-            eligibility_text = eligibility_text[:750] + "..."
+        eligibility_text = sections['eligibility'][:750]
         parts.append(f"\nEligibility:\n{eligibility_text}")
 
     # Funding information
@@ -112,25 +238,21 @@ def extract_embedding_text(grant: Dict[str, Any]) -> str:
         funding_section = sections['funding']
         if isinstance(funding_section, dict):
             parts.append("\nFunding:")
-            for country, info in funding_section.items():
-                info_text = info[:400] + "..." if len(info) > 400 else info
+            for country, info in list(funding_section.items())[:5]:
+                info_text = info[:400] if len(info) > 400 else info
                 parts.append(f"  {country}: {info_text}")
         else:
-            funding_text = funding_section[:600] + "..." if len(funding_section) > 600 else funding_section
+            funding_text = funding_section[:600]
             parts.append(f"\nFunding:\n{funding_text}")
 
     # Key dates
     if sections.get('key_dates'):
-        dates_text = sections['key_dates']
-        if len(dates_text) > 500:
-            dates_text = dates_text[:450] + "..."
+        dates_text = sections['key_dates'][:450]
         parts.append(f"\nKey Dates:\n{dates_text}")
 
     # How to apply
     if sections.get('how_to_apply'):
-        apply_text = sections['how_to_apply']
-        if len(apply_text) > 600:
-            apply_text = apply_text[:550] + "..."
+        apply_text = sections['how_to_apply'][:550]
         parts.append(f"\nHow to Apply:\n{apply_text}")
 
     # Country-specific information
@@ -138,15 +260,19 @@ def extract_embedding_text(grant: Dict[str, Any]) -> str:
         country_info = sections['country_info']
         if isinstance(country_info, dict):
             parts.append("\nCountry Information:")
-            for country, info in list(country_info.items())[:3]:  # Limit to 3 countries to avoid token limit
-                info_text = info[:300] + "..." if len(info) > 300 else info
+            for country, info in list(country_info.items())[:3]:
+                info_text = info[:300] if len(info) > 300 else info
                 parts.append(f"  {country}: {info_text}")
+
+    # Sectors
+    if grant_doc.get('sectors'):
+        parts.append(f"\nSectors: {', '.join(grant_doc['sectors'])}")
 
     return "\n".join(parts)
 
 
-def create_embedding(text: str) -> List[float]:
-    """Generate embedding using OpenAI"""
+def create_embedding(text: str) -> Optional[List[float]]:
+    """Generate embedding using OpenAI."""
     try:
         response = openai.embeddings.create(
             input=text,
@@ -154,99 +280,124 @@ def create_embedding(text: str) -> List[float]:
         )
         return response.data[0].embedding
     except Exception as e:
-        print(f"⚠️  Error creating embedding: {e}")
+        print(f"Error creating embedding: {e}")
         return None
 
 
-def insert_to_postgres(grant: Dict[str, Any], cursor):
-    """Insert grant into PostgreSQL grants table"""
+def upsert_to_mongodb(grant_doc: Dict[str, Any]) -> bool:
+    """Upsert grant document to MongoDB."""
     try:
-        # Extract summary (first 500 chars of description)
-        raw = grant.get('raw', {})
-        description = raw.get('description', '')
-        summary = description[:500] if description else ''
-
-        cursor.execute("""
-            INSERT INTO grants (
-                grant_id, source, title, url, call_id, status, programme,
-                open_date, close_date, description_summary, scraped_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
-            ON CONFLICT (grant_id) DO UPDATE SET
-                title = EXCLUDED.title,
-                url = EXCLUDED.url,
-                status = EXCLUDED.status,
-                programme = EXCLUDED.programme,
-                open_date = EXCLUDED.open_date,
-                close_date = EXCLUDED.close_date,
-                description_summary = EXCLUDED.description_summary,
-                updated_at = NOW()
-        """, (
-            grant['id'],
-            grant['source'],
-            grant['title'],
-            grant['url'],
-            grant.get('call_id'),
-            grant.get('status'),
-            grant.get('programme'),
-            grant.get('open_date'),
-            grant.get('close_date'),
-            summary
-        ))
+        result = db.grants.update_one(
+            {"grant_id": grant_doc["grant_id"]},
+            {
+                "$set": grant_doc,
+                "$setOnInsert": {"created_at": datetime.utcnow()}
+            },
+            upsert=True
+        )
         return True
     except Exception as e:
-        print(f"⚠️  Error inserting to PostgreSQL: {e}")
+        print(f"Error upserting to MongoDB: {e}")
         return False
 
 
-def upsert_to_pinecone(grant: Dict[str, Any], embedding: List[float]):
-    """Upsert grant to Pinecone"""
+def upsert_to_pinecone(grant_doc: Dict[str, Any], embedding: List[float]) -> bool:
+    """Upsert grant to Pinecone."""
     try:
-        # Prepare metadata
+        # Prepare metadata (Pinecone has metadata size limits)
         metadata = {
-            'source': grant['source'],
-            'title': grant['title'],
-            'url': grant['url'],
-            'status': grant.get('status', 'Unknown'),
-            'is_supplemental': grant.get('is_supplemental', False),
+            'source': 'eureka',
+            'title': grant_doc['title'][:500],
+            'status': grant_doc.get('status', 'unknown'),
+            'url': grant_doc['url'],
         }
 
-        if grant.get('programme'):
-            metadata['programme'] = grant['programme']
+        if grant_doc.get('programme'):
+            metadata['programme'] = grant_doc['programme'][:100]
 
-        if grant.get('open_date'):
-            metadata['open_date'] = grant['open_date']
+        if grant_doc.get('opens_at'):
+            metadata['opens_at'] = grant_doc['opens_at'].isoformat() if isinstance(grant_doc['opens_at'], datetime) else str(grant_doc['opens_at'])
 
-        if grant.get('close_date'):
-            metadata['close_date'] = grant['close_date']
+        if grant_doc.get('closes_at'):
+            metadata['closes_at'] = grant_doc['closes_at'].isoformat() if isinstance(grant_doc['closes_at'], datetime) else str(grant_doc['closes_at'])
+
+        if grant_doc.get('is_active') is not None:
+            metadata['is_active'] = grant_doc['is_active']
 
         # Upsert to Pinecone
         index.upsert(
             vectors=[{
-                'id': grant['id'],
+                'id': grant_doc['grant_id'],
                 'values': embedding,
                 'metadata': metadata
             }]
         )
         return True
     except Exception as e:
-        print(f"⚠️  Error upserting to Pinecone: {e}")
+        print(f"Error upserting to Pinecone: {e}")
         return False
 
 
+def ingest_eureka_grants(grants: List[Dict[str, Any]]) -> Dict[str, int]:
+    """
+    Process list of grants from eureka_scraper.py.
+
+    Args:
+        grants: Raw grants from scraper
+
+    Returns:
+        Dictionary with success/fail counts
+    """
+    success_count = 0
+    fail_count = 0
+
+    for grant in tqdm(grants, desc="Processing grants"):
+        try:
+            # Normalize to MongoDB doc
+            grant_doc = normalize_eureka_grant(grant)
+
+            # Upsert to MongoDB
+            if not upsert_to_mongodb(grant_doc):
+                fail_count += 1
+                continue
+
+            # Generate embedding
+            embedding_text = extract_embedding_text(grant_doc)
+            embedding = create_embedding(embedding_text)
+
+            if not embedding:
+                print(f"Skipping Pinecone for {grant_doc['grant_id']} - embedding failed")
+                fail_count += 1
+                continue
+
+            # Upsert to Pinecone
+            if not upsert_to_pinecone(grant_doc, embedding):
+                fail_count += 1
+                continue
+
+            success_count += 1
+
+        except Exception as e:
+            print(f"Failed to ingest {grant.get('title')}: {e}")
+            fail_count += 1
+
+    return {'success': success_count, 'failed': fail_count}
+
+
 def main():
-    """Main ingestion pipeline"""
+    """Main ingestion pipeline."""
     print("=" * 60)
-    print("EUREKA NETWORK GRANT INGESTION")
+    print("EUREKA NETWORK GRANT INGESTION (MongoDB)")
     print("=" * 60)
 
     # Load grants
     grants = load_eureka_grants()
     if not grants:
-        print("❌ No grants to ingest")
+        print("No grants to ingest")
         return
 
     # Filter options
-    print(f"\n📊 Total grants loaded: {len(grants)}")
+    print(f"\nTotal grants loaded: {len(grants)}")
     primary = [g for g in grants if not g.get('is_supplemental', False)]
     supplemental = [g for g in grants if g.get('is_supplemental', False)]
     print(f"   - Primary R&D grants: {len(primary)}")
@@ -254,80 +405,56 @@ def main():
 
     # Ask user what to ingest
     print("\nWhat would you like to ingest?")
-    print("1. All grants (40 total)")
-    print("2. Primary R&D grants only (29 grants)")
-    print("3. Supplemental opportunities only (11 grants)")
+    print(f"1. All grants ({len(grants)} total)")
+    print(f"2. Primary R&D grants only ({len(primary)} grants)")
+    print(f"3. Supplemental opportunities only ({len(supplemental)} grants)")
 
     choice = input("\nEnter choice (1-3) [default: 1]: ").strip() or "1"
 
     if choice == "2":
         grants_to_ingest = primary
-        print(f"\n✅ Ingesting {len(grants_to_ingest)} primary R&D grants")
+        print(f"\nIngesting {len(grants_to_ingest)} primary R&D grants")
     elif choice == "3":
         grants_to_ingest = supplemental
-        print(f"\n✅ Ingesting {len(grants_to_ingest)} supplemental opportunities")
+        print(f"\nIngesting {len(grants_to_ingest)} supplemental opportunities")
     else:
         grants_to_ingest = grants
-        print(f"\n✅ Ingesting all {len(grants_to_ingest)} grants")
+        print(f"\nIngesting all {len(grants_to_ingest)} grants")
 
-    # Create database cursor
-    cursor = pg_conn.cursor()
-
-    # Process each grant
-    success_pg = 0
-    success_pc = 0
-
-    print(f"\n🚀 Starting ingestion...")
-
-    for grant in tqdm(grants_to_ingest, desc="Processing grants"):
-        # Extract embedding text
-        embedding_text = extract_embedding_text(grant)
-
-        # Create embedding
-        embedding = create_embedding(embedding_text)
-        if not embedding:
-            print(f"\n⚠️  Skipping {grant['id']} - embedding failed")
-            continue
-
-        # Insert to PostgreSQL
-        if insert_to_postgres(grant, cursor):
-            success_pg += 1
-
-        # Upsert to Pinecone
-        if upsert_to_pinecone(grant, embedding):
-            success_pc += 1
-
-    # Commit PostgreSQL changes
-    pg_conn.commit()
-    cursor.close()
+    # Process grants
+    print(f"\nStarting ingestion...")
+    results = ingest_eureka_grants(grants_to_ingest)
 
     # Print summary
     print("\n" + "=" * 60)
     print("INGESTION COMPLETE")
     print("=" * 60)
-    print(f"✅ PostgreSQL: {success_pg}/{len(grants_to_ingest)} grants inserted")
-    print(f"✅ Pinecone: {success_pc}/{len(grants_to_ingest)} grants indexed")
+    print(f"MongoDB + Pinecone: {results['success']}/{len(grants_to_ingest)} grants ingested")
 
-    if success_pg == len(grants_to_ingest) and success_pc == len(grants_to_ingest):
-        print("\n🎉 All grants successfully ingested!")
+    if results['success'] == len(grants_to_ingest):
+        print("\nAll grants successfully ingested!")
     else:
-        print(f"\n⚠️  Some grants failed to ingest")
-        print(f"   PostgreSQL failures: {len(grants_to_ingest) - success_pg}")
-        print(f"   Pinecone failures: {len(grants_to_ingest) - success_pc}")
+        print(f"\nSome grants failed to ingest")
+        print(f"   Failures: {results['failed']}")
+
+    # Print verification command
+    print("\n" + "-" * 60)
+    print("Verify with:")
+    print(f"  mongosh \"{MONGO_URI}\" --eval 'use {MONGO_DB_NAME}; db.grants.countDocuments({{source: \"eureka\"}})'")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\n❌ Ingestion cancelled by user")
+        print("\n\nIngestion cancelled by user")
         sys.exit(1)
     except Exception as e:
-        print(f"\n\n❌ Fatal error: {e}")
+        print(f"\n\nFatal error: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
     finally:
         # Close connections
-        if pg_conn:
-            pg_conn.close()
+        if mongo_client:
+            mongo_client.close()

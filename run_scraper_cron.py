@@ -2,6 +2,7 @@
 """
 Cron wrapper for Eureka Network scraper + ingestion pipeline.
 Runs scraping and ingestion automatically with proper logging and error handling.
+Uses MongoDB for grant storage.
 """
 
 import sys
@@ -13,17 +14,17 @@ from datetime import datetime
 from typing import Dict, Any, List
 import traceback
 
-import psycopg2
 import openai
+from pymongo import MongoClient
 from pinecone import Pinecone
 from dotenv import load_dotenv
 
 # Import scraper and ingestion functions
 from eureka_scraper import EurekaNetworkScraper
 from ingest_eureka_only import (
+    normalize_eureka_grant,
     extract_embedding_text,
     create_embedding,
-    insert_to_postgres,
     upsert_to_pinecone
 )
 
@@ -34,7 +35,8 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "ailsa-grants")
-DATABASE_URL = os.getenv("DATABASE_URL")
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "ailsa_grants")
 LOG_DIR = Path("logs")
 DATA_DIR = Path("data/eureka_network")
 
@@ -57,9 +59,9 @@ logger = logging.getLogger(__name__)
 
 def validate_environment() -> bool:
     """Validate all required environment variables are set."""
-    if not all([OPENAI_API_KEY, PINECONE_API_KEY, DATABASE_URL]):
+    if not all([OPENAI_API_KEY, PINECONE_API_KEY, MONGO_URI]):
         logger.error("Missing required environment variables!")
-        logger.error("Required: OPENAI_API_KEY, PINECONE_API_KEY, DATABASE_URL")
+        logger.error("Required: OPENAI_API_KEY, PINECONE_API_KEY, MONGO_URI")
         return False
     return True
 
@@ -79,24 +81,24 @@ def run_scraper() -> List[Dict[str, Any]]:
         scraper = EurekaNetworkScraper()
         grants = scraper.scrape_all()
 
-        logger.info(f"✅ Scraped {len(grants)} grants")
+        logger.info(f"Scraped {len(grants)} grants")
 
         # Save to file
         output_file = DATA_DIR / "normalized.json"
         output_file.write_text(json.dumps(grants, indent=2, ensure_ascii=False))
-        logger.info(f"✅ Saved to {output_file}")
+        logger.info(f"Saved to {output_file}")
 
         return grants
 
     except Exception as e:
-        logger.error(f"❌ Scraping failed: {e}")
+        logger.error(f"Scraping failed: {e}")
         logger.error(traceback.format_exc())
         raise
 
 
 def run_ingestion(grants: List[Dict[str, Any]], ingest_all: bool = True) -> Dict[str, int]:
     """
-    Run the ingestion pipeline.
+    Run the ingestion pipeline to MongoDB + Pinecone.
 
     Args:
         grants: List of grants to ingest
@@ -106,7 +108,7 @@ def run_ingestion(grants: List[Dict[str, Any]], ingest_all: bool = True) -> Dict
         Dictionary with success counts
     """
     logger.info("=" * 60)
-    logger.info("STEP 2: INGESTING TO POSTGRESQL + PINECONE")
+    logger.info("STEP 2: INGESTING TO MONGODB + PINECONE")
     logger.info("=" * 60)
 
     # Filter grants if needed
@@ -123,15 +125,15 @@ def run_ingestion(grants: List[Dict[str, Any]], ingest_all: bool = True) -> Dict
         openai.api_key = OPENAI_API_KEY
         pc = Pinecone(api_key=PINECONE_API_KEY)
         index = pc.Index(PINECONE_INDEX_NAME)
-        pg_conn = psycopg2.connect(DATABASE_URL)
-        cursor = pg_conn.cursor()
-        logger.info("✅ Connected to OpenAI, Pinecone, and PostgreSQL")
+        mongo_client = MongoClient(MONGO_URI)
+        db = mongo_client[MONGO_DB_NAME]
+        logger.info("Connected to OpenAI, Pinecone, and MongoDB")
     except Exception as e:
-        logger.error(f"❌ Failed to connect to services: {e}")
+        logger.error(f"Failed to connect to services: {e}")
         raise
 
     # Process each grant
-    success_pg = 0
+    success_mongo = 0
     success_pc = 0
     failed_grants = []
 
@@ -140,64 +142,66 @@ def run_ingestion(grants: List[Dict[str, Any]], ingest_all: bool = True) -> Dict
         logger.info(f"Processing {i}/{len(grants_to_ingest)}: {grant_id}")
 
         try:
-            # Extract embedding text
-            embedding_text = extract_embedding_text(grant)
+            # Normalize to MongoDB document
+            grant_doc = normalize_eureka_grant(grant)
+
+            # Upsert to MongoDB
+            try:
+                db.grants.update_one(
+                    {"grant_id": grant_doc["grant_id"]},
+                    {
+                        "$set": grant_doc,
+                        "$setOnInsert": {"created_at": datetime.utcnow()}
+                    },
+                    upsert=True
+                )
+                success_mongo += 1
+                logger.info(f"  MongoDB OK")
+            except Exception as e:
+                logger.warning(f"  MongoDB failed for {grant_id}: {e}")
+                failed_grants.append((grant_id, "mongo_failed"))
 
             # Create embedding
+            embedding_text = extract_embedding_text(grant_doc)
             embedding = create_embedding(embedding_text)
+
             if not embedding:
-                logger.warning(f"⚠️  Skipping {grant_id} - embedding failed")
+                logger.warning(f"  Skipping Pinecone - embedding failed")
                 failed_grants.append((grant_id, "embedding_failed"))
                 continue
 
-            # Insert to PostgreSQL
-            if insert_to_postgres(grant, cursor):
-                success_pg += 1
-                logger.info(f"  ✅ PostgreSQL")
-            else:
-                logger.warning(f"  ⚠️  PostgreSQL failed for {grant_id}")
-                failed_grants.append((grant_id, "postgres_failed"))
-
             # Upsert to Pinecone
-            if upsert_to_pinecone(grant, embedding):
+            if upsert_to_pinecone(grant_doc, embedding):
                 success_pc += 1
-                logger.info(f"  ✅ Pinecone")
+                logger.info(f"  Pinecone OK")
             else:
-                logger.warning(f"  ⚠️  Pinecone failed for {grant_id}")
+                logger.warning(f"  Pinecone failed for {grant_id}")
                 failed_grants.append((grant_id, "pinecone_failed"))
 
         except Exception as e:
-            logger.error(f"❌ Error processing {grant_id}: {e}")
+            logger.error(f"Error processing {grant_id}: {e}")
             logger.error(traceback.format_exc())
             failed_grants.append((grant_id, str(e)))
             continue
 
-    # Commit PostgreSQL changes
-    try:
-        pg_conn.commit()
-        logger.info("✅ PostgreSQL transaction committed")
-    except Exception as e:
-        logger.error(f"❌ Failed to commit PostgreSQL transaction: {e}")
-        pg_conn.rollback()
-    finally:
-        cursor.close()
-        pg_conn.close()
+    # Close MongoDB connection
+    mongo_client.close()
 
     # Log summary
     logger.info("=" * 60)
     logger.info("INGESTION SUMMARY")
     logger.info("=" * 60)
-    logger.info(f"PostgreSQL: {success_pg}/{len(grants_to_ingest)} grants inserted")
+    logger.info(f"MongoDB: {success_mongo}/{len(grants_to_ingest)} grants inserted")
     logger.info(f"Pinecone: {success_pc}/{len(grants_to_ingest)} grants indexed")
 
     if failed_grants:
-        logger.warning(f"⚠️  {len(failed_grants)} grants had issues:")
+        logger.warning(f"{len(failed_grants)} grants had issues:")
         for grant_id, reason in failed_grants[:10]:  # Show first 10
             logger.warning(f"  - {grant_id}: {reason}")
 
     return {
         "total": len(grants_to_ingest),
-        "postgres_success": success_pg,
+        "mongo_success": success_mongo,
         "pinecone_success": success_pc,
         "failed": len(failed_grants)
     }
@@ -217,7 +221,7 @@ def write_run_summary(grants_count: int, ingestion_results: Dict[str, int], elap
 
     summary_file = LOG_DIR / f"summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     summary_file.write_text(json.dumps(summary, indent=2))
-    logger.info(f"✅ Run summary saved to {summary_file}")
+    logger.info(f"Run summary saved to {summary_file}")
 
     # Also update "latest" summary
     latest_summary = LOG_DIR / "latest_run.json"
@@ -235,14 +239,14 @@ def main():
     try:
         # Validate environment
         if not validate_environment():
-            logger.error("❌ Environment validation failed")
+            logger.error("Environment validation failed")
             sys.exit(1)
 
         # Run scraper
         grants = run_scraper()
 
         if not grants:
-            logger.warning("⚠️  No grants scraped - skipping ingestion")
+            logger.warning("No grants scraped - skipping ingestion")
             sys.exit(0)
 
         # Run ingestion (all grants by default, change to False for primary only)
@@ -262,7 +266,7 @@ def main():
 
         # Exit with appropriate code
         if ingestion_results["failed"] > 0:
-            logger.warning("⚠️  Some grants failed - check logs")
+            logger.warning("Some grants failed - check logs")
             sys.exit(2)  # Partial success
         else:
             sys.exit(0)  # Full success

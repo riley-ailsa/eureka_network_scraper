@@ -1,128 +1,131 @@
 #!/usr/bin/env python3
 """
-Test connections to Pinecone and PostgreSQL.
+Test connections to MongoDB, Pinecone, and OpenAI.
 Run this to verify everything is set up correctly.
 """
 
 import os
 from dotenv import load_dotenv
 from pinecone import Pinecone
-import psycopg2
+from pymongo import MongoClient
 import openai
 
 # Load environment variables
 load_dotenv()
 
+
 def test_pinecone():
     """Test Pinecone connection"""
-    print("\n🧪 Testing Pinecone...")
-    
+    print("\nTesting Pinecone...")
+
     try:
         api_key = os.getenv("PINECONE_API_KEY")
         index_name = os.getenv("PINECONE_INDEX_NAME", "ailsa-grants")
-        
+
         pc = Pinecone(api_key=api_key)
         index = pc.Index(index_name)
-        
+
         stats = index.describe_index_stats()
-        
-        print(f"✅ Pinecone connected!")
+
+        print(f"Pinecone connected!")
         print(f"   Index: {index_name}")
         print(f"   Dimension: {stats['dimension']}")
         print(f"   Total vectors: {stats['total_vector_count']}")
-        
+
         return True
     except Exception as e:
-        print(f"❌ Pinecone connection failed: {e}")
+        print(f"Pinecone connection failed: {e}")
         return False
 
 
-def test_postgres():
-    """Test PostgreSQL connection"""
-    print("\n🧪 Testing PostgreSQL...")
-    
+def test_mongodb():
+    """Test MongoDB connection"""
+    print("\nTesting MongoDB...")
+
     try:
-        database_url = os.getenv("DATABASE_URL")
-        conn = psycopg2.connect(database_url)
-        cursor = conn.cursor()
-        
-        # Test query
-        cursor.execute("SELECT version();")
-        version = cursor.fetchone()[0]
-        
-        # Check if tables exist
-        cursor.execute("""
-            SELECT table_name 
-            FROM information_schema.tables 
-            WHERE table_schema = 'public'
-        """)
-        tables = [row[0] for row in cursor.fetchall()]
-        
-        print(f"✅ PostgreSQL connected!")
-        print(f"   Version: {version[:50]}...")
-        print(f"   Tables found: {len(tables)}")
-        print(f"   Sample tables: {tables[:5]}")
-        
-        cursor.close()
-        conn.close()
+        mongo_uri = os.getenv("MONGO_URI")
+        db_name = os.getenv("MONGO_DB_NAME", "ailsa_grants")
+
+        client = MongoClient(mongo_uri)
+        db = client[db_name]
+
+        # Test connection by listing collections
+        collections = db.list_collection_names()
+
+        # Get server info
+        server_info = client.server_info()
+        version = server_info.get('version', 'unknown')
+
+        # Count grants if collection exists
+        grant_count = 0
+        if 'grants' in collections:
+            grant_count = db.grants.count_documents({})
+
+        print(f"MongoDB connected!")
+        print(f"   Server version: {version}")
+        print(f"   Database: {db_name}")
+        print(f"   Collections: {collections if collections else '(none)'}")
+        print(f"   Grants count: {grant_count}")
+
+        client.close()
         return True
     except Exception as e:
-        print(f"❌ PostgreSQL connection failed: {e}")
+        print(f"MongoDB connection failed: {e}")
         return False
 
 
 def test_openai():
     """Test OpenAI connection"""
-    print("\n🧪 Testing OpenAI...")
-    
+    print("\nTesting OpenAI...")
+
     try:
         api_key = os.getenv("OPENAI_API_KEY")
         openai.api_key = api_key
-        
+
         # Test embedding
         response = openai.embeddings.create(
             input="test",
             model="text-embedding-3-small"
         )
-        
+
         embedding = response.data[0].embedding
-        
-        print(f"✅ OpenAI connected!")
+
+        print(f"OpenAI connected!")
         print(f"   Model: text-embedding-3-small")
         print(f"   Embedding dimensions: {len(embedding)}")
-        
+
         return True
     except Exception as e:
-        print(f"❌ OpenAI connection failed: {e}")
+        print(f"OpenAI connection failed: {e}")
         return False
 
 
 def main():
-    print("="*60)
+    print("=" * 60)
     print("CONNECTION TESTS")
-    print("="*60)
-    
+    print("=" * 60)
+
     results = {
         'pinecone': test_pinecone(),
-        'postgres': test_postgres(),
+        'mongodb': test_mongodb(),
         'openai': test_openai()
     }
-    
-    print("\n" + "="*60)
+
+    print("\n" + "=" * 60)
     print("RESULTS")
-    print("="*60)
-    
+    print("=" * 60)
+
     all_passed = all(results.values())
-    
+
     for service, passed in results.items():
-        status = "✅ PASS" if passed else "❌ FAIL"
+        status = "PASS" if passed else "FAIL"
         print(f"{service.upper()}: {status}")
-    
+
     if all_passed:
-        print("\n🎉 All connections successful! Ready to ingest data.")
+        print("\nAll connections successful! Ready to ingest data.")
     else:
-        print("\n⚠️  Some connections failed. Fix errors above before proceeding.")
-    
+        print("\nSome connections failed. Fix errors above before proceeding.")
+
     return all_passed
 
 

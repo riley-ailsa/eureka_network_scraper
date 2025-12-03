@@ -145,7 +145,8 @@ Make sure these are set in production:
 OPENAI_API_KEY=sk-...
 PINECONE_API_KEY=...
 PINECONE_INDEX_NAME=ailsa-grants
-DATABASE_URL=postgresql://user:pass@host:5432/dbname
+MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net/
+MONGO_DB_NAME=ailsa_grants
 
 # Optional
 SLACK_WEBHOOK_URL=https://hooks.slack.com/...
@@ -153,14 +154,59 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/...
 
 ---
 
+## MongoDB Setup
+
+### MongoDB Atlas (Recommended for Production)
+
+1. Create a free cluster at [MongoDB Atlas](https://www.mongodb.com/cloud/atlas)
+2. Create a database user with read/write permissions
+3. Whitelist your server's IP address (or use 0.0.0.0/0 for development)
+4. Get the connection string and set as `MONGO_URI`
+
+```bash
+# Example MongoDB Atlas connection string
+MONGO_URI=mongodb+srv://username:password@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority
+```
+
+### Local MongoDB (Development)
+
+```bash
+# Install MongoDB
+brew install mongodb-community  # macOS
+# or
+sudo apt install mongodb        # Ubuntu
+
+# Start MongoDB
+brew services start mongodb-community  # macOS
+sudo systemctl start mongodb           # Linux
+
+# Connection string for local MongoDB
+MONGO_URI=mongodb://localhost:27017
+```
+
+### Create Index for Performance
+
+```javascript
+// Connect to MongoDB and create index on grant_id
+use ailsa_grants;
+db.grants.createIndex({ "grant_id": 1 }, { unique: true });
+db.grants.createIndex({ "source": 1 });
+db.grants.createIndex({ "status": 1 });
+db.grants.createIndex({ "closes_at": 1 });
+```
+
+---
+
 ## Security Checklist
 
 - [ ] `.env` file NOT committed to git
-- [ ] Database uses SSL connection
+- [ ] MongoDB uses authentication
+- [ ] MongoDB connection uses TLS/SSL (Atlas does this by default)
 - [ ] API keys rotated regularly
 - [ ] Logs don't contain sensitive data
 - [ ] Container runs as non-root user (if using Docker)
 - [ ] Network access restricted (firewall rules)
+- [ ] MongoDB IP whitelist configured (Atlas)
 
 ---
 
@@ -169,18 +215,22 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/...
 ### Backup Strategy
 
 ```bash
-# Backup PostgreSQL
-pg_dump $DATABASE_URL > backups/grants_$(date +%Y%m%d).sql
+# Backup MongoDB (Atlas has automated backups)
+# For self-hosted MongoDB:
+mongodump --uri="$MONGO_URI" --out=backups/$(date +%Y%m%d)
 
-# Backup Pinecone vectors (if needed)
-# Pinecone has built-in backups, but you can export metadata
+# Or export specific collection
+mongoexport --uri="$MONGO_URI" --db=ailsa_grants --collection=grants --out=backups/grants_$(date +%Y%m%d).json
 ```
 
 ### Recovery
 
 ```bash
-# Restore PostgreSQL
-psql $DATABASE_URL < backups/grants_20251120.sql
+# Restore MongoDB
+mongorestore --uri="$MONGO_URI" backups/20251120/
+
+# Or import specific collection
+mongoimport --uri="$MONGO_URI" --db=ailsa_grants --collection=grants --file=backups/grants_20251120.json
 
 # Re-run scraper to rebuild Pinecone
 python3 run_scraper_cron.py
@@ -197,6 +247,12 @@ Current setup handles 40 grants easily. If scaling:
 3. **High frequency (hourly):** Consider rate limiting on OpenAI API
 4. **Large embeddings:** Monitor Pinecone quota and costs
 
+### MongoDB Scaling
+
+- **Atlas M0 (Free):** Good for development, 512MB storage
+- **Atlas M10+:** Production workloads, dedicated resources
+- **Sharding:** For very large datasets (millions of documents)
+
 ---
 
 ## Cost Estimates
@@ -204,7 +260,7 @@ Current setup handles 40 grants easily. If scaling:
 **Current usage (weekly runs):**
 - OpenAI embeddings: 40 grants × $0.0001/1K tokens ≈ $0.10/month
 - Pinecone: Depends on plan, starter plan sufficient
-- PostgreSQL: Minimal (few KB per grant)
+- MongoDB Atlas: Free tier (M0) or ~$9/month (M10)
 - Server/hosting: Depends on platform
 
 **Daily runs:** Multiply by ~4
@@ -219,6 +275,8 @@ Option 1 (Direct + Cron) on a small VPS
 - DigitalOcean Droplet ($6/month)
 - AWS EC2 t2.micro (free tier)
 - Google Cloud e2-micro (free tier)
+
++ MongoDB Atlas M0 (free) or M10 ($9/month)
 ```
 
 **For enterprise:**
@@ -227,6 +285,8 @@ Option 2 (Docker) + Kubernetes
 - Scalable
 - High availability
 - Easy rollbacks
+
++ MongoDB Atlas M30+ (dedicated cluster)
 ```
 
 **For serverless:**
@@ -235,6 +295,8 @@ Option 3 (Cloud Functions)
 - AWS Lambda + EventBridge
 - Pay only when running
 - Zero maintenance
+
++ MongoDB Atlas Serverless
 ```
 
 ---
@@ -247,7 +309,7 @@ git clone <repo>
 cd eureka_network_scraper
 pip install -r requirements.txt
 cp .env.template .env
-# Edit .env
+# Edit .env with MongoDB URI and other credentials
 python test_connections.py
 ./setup_cron.sh
 ```
@@ -257,7 +319,7 @@ python test_connections.py
 git clone <repo>
 cd eureka_network_scraper
 cp .env.template .env
-# Edit .env
+# Edit .env with MongoDB URI and other credentials
 docker-compose up -d
 ```
 
@@ -270,6 +332,40 @@ cd package && zip -r ../lambda.zip . && cd ..
 aws lambda create-function --function-name eureka-scraper \
   --runtime python3.11 --handler run_scraper_cron.main \
   --zip-file fileb://lambda.zip
+```
+
+---
+
+## Verifying Deployment
+
+After deployment, verify the system is working:
+
+```bash
+# 1. Test connections
+python test_connections.py
+
+# 2. Run a manual scrape
+python run_scraper_cron.py
+
+# 3. Check MongoDB
+mongosh "$MONGO_URI" --eval 'use ailsa_grants; db.grants.countDocuments({source: "eureka"})'
+
+# 4. Check logs
+cat logs/latest_run.json
+```
+
+Expected output:
+```json
+{
+  "timestamp": "2025-11-20T15:30:00",
+  "scraping": { "grants_found": 40 },
+  "ingestion": {
+    "total": 40,
+    "mongo_success": 40,
+    "pinecone_success": 40,
+    "failed": 0
+  }
+}
 ```
 
 ---

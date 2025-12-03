@@ -4,7 +4,7 @@ Automated scraper and ingestion pipeline for Eureka Network funding opportunitie
 
 ## Overview
 
-Scrapes grant data from the Eureka Network website (https://www.eurekanetwork.org/programmes-and-calls/) and ingests it into PostgreSQL + Pinecone with OpenAI embeddings. Includes automated scheduling via cron jobs.
+Scrapes grant data from the Eureka Network website (https://www.eurekanetwork.org/programmes-and-calls/) and ingests it into MongoDB + Pinecone with OpenAI embeddings. Includes automated scheduling via cron jobs.
 
 ## Features
 
@@ -12,7 +12,7 @@ Scrapes grant data from the Eureka Network website (https://www.eurekanetwork.or
 - **Structured content extraction** - About, eligibility, funding by country, application instructions, key dates
 - **Smart pagination** - Handles multi-page listings automatically
 - **Rich embeddings** - Uses all structured sections for semantic search
-- **Automated ingestion** - PostgreSQL + Pinecone with proper error handling
+- **Automated ingestion** - MongoDB + Pinecone with proper error handling
 - **Cron scheduling** - Set it and forget it with automated runs
 - **Detailed logging** - Track success/failures with timestamped logs and JSON summaries
 
@@ -33,7 +33,8 @@ cp .env.template .env
 # - OPENAI_API_KEY
 # - PINECONE_API_KEY
 # - PINECONE_INDEX_NAME (default: ailsa-grants)
-# - DATABASE_URL (PostgreSQL connection string)
+# - MONGO_URI (MongoDB connection string)
+# - MONGO_DB_NAME (default: ailsa_grants)
 ```
 
 ### 2. Test Connections
@@ -42,7 +43,7 @@ cp .env.template .env
 python test_connections.py
 ```
 
-Make sure all three connections pass ✅ (OpenAI, Pinecone, PostgreSQL)
+Make sure all three connections pass (OpenAI, Pinecone, MongoDB)
 
 ### 3. Run Scraper + Ingestion
 
@@ -121,25 +122,62 @@ chmod +x setup_cron.sh
 
 **Note:** `is_supplemental: true` for Investment Readiness opportunities, `false` for traditional R&D grants.
 
-## Database Schema
+## MongoDB Document Schema
 
-### PostgreSQL (`grants` table)
-- `grant_id` - Primary key (e.g., `eureka_network:call-slug`)
-- `source` - Always "eureka_network"
-- `title` - Grant title
-- `url` - Grant detail page URL
-- `call_id` - Call identifier
-- `status` - Open/Closed/Unknown
-- `programme` - Programme name
-- `open_date`, `close_date` - Dates
-- `description_summary` - First 500 chars of description
-- `scraped_at`, `updated_at` - Timestamps
+Grants are stored in MongoDB with the following schema:
+
+```javascript
+{
+  // Primary identifiers
+  "grant_id": "eureka_call-slug",     // Unique ID prefixed with "eureka_"
+  "source": "eureka",                  // Always "eureka"
+  "external_id": "call-slug",          // Original call identifier
+
+  // Core metadata
+  "title": "Call Title",
+  "url": "https://www.eurekanetwork.org/...",
+  "description": "Full description text...",
+
+  // Status & dates
+  "status": "open",                    // open/closed/upcoming/unknown
+  "is_active": true,                   // true if status == "open"
+  "opens_at": ISODate("2025-07-01"),
+  "closes_at": ISODate("2025-11-21"),
+
+  // Funding
+  "total_fund_gbp": null,              // Eureka often doesn't specify total pot
+  "total_fund_display": "Funding info text",
+  "project_funding_min": null,
+  "project_funding_max": null,
+  "competition_type": "grant",
+
+  // Programme info
+  "programme": "Eurostars",            // e.g., Eurostars, GlobalStars, Network Projects
+
+  // Classification
+  "tags": ["eureka", "eurostars"],
+  "sectors": ["technology", "healthcare"],
+
+  // Raw data (preserved for re-parsing)
+  "raw": {
+    "description": "...",
+    "funding_info": "...",
+    "sections": {...},
+    "is_supplemental": false,
+    "original_id": "eureka_network:call-slug",
+    "original_source": "eureka_network"
+  },
+
+  // Timestamps
+  "scraped_at": ISODate("2025-11-20T10:00:00Z"),
+  "updated_at": ISODate("2025-11-20T10:00:00Z"),
+  "created_at": ISODate("2025-11-20T10:00:00Z")
+}
+```
 
 ### Pinecone (`ailsa-grants` index)
 - Vector embedding from all structured sections
-- Metadata: `source`, `title`, `url`, `status`, `programme`, `open_date`, `close_date`, `is_supplemental`
-
-See [schema.sql](schema.sql) for full database schema.
+- Metadata: `source`, `title`, `url`, `status`, `programme`, `opens_at`, `closes_at`, `is_active`
 
 ## Ingestion Options
 
@@ -177,19 +215,20 @@ Choose your schedule:
 
 ```
 1. Scraping Phase
-   ├─ Fetches all grants from Eureka Network
-   ├─ Extracts structured content
-   └─ Saves to data/eureka_network/normalized.json
+   - Fetches all grants from Eureka Network
+   - Extracts structured content
+   - Saves to data/eureka_network/normalized.json
 
 2. Ingestion Phase
-   ├─ Generates OpenAI embeddings
-   ├─ Inserts/updates grants in PostgreSQL
-   └─ Indexes embeddings in Pinecone
+   - Normalizes grants to MongoDB schema
+   - Upserts documents to MongoDB
+   - Generates OpenAI embeddings
+   - Indexes embeddings in Pinecone
 
 3. Logging & Monitoring
-   ├─ Detailed log: logs/cron_YYYYMMDD_HHMMSS.log
-   ├─ Run summary: logs/summary_YYYYMMDD_HHMMSS.json
-   └─ Latest run: logs/latest_run.json
+   - Detailed log: logs/cron_YYYYMMDD_HHMMSS.log
+   - Run summary: logs/summary_YYYYMMDD_HHMMSS.json
+   - Latest run: logs/latest_run.json
 ```
 
 **Typical runtime:** 3-7 minutes per run
@@ -217,7 +256,7 @@ Example summary output:
   },
   "ingestion": {
     "total": 40,
-    "postgres_success": 40,
+    "mongo_success": 40,
     "pinecone_success": 40,
     "failed": 0
   },
@@ -247,8 +286,7 @@ crontab -e
 | `ingest_eureka_only.py` | Ingestion script (interactive) |
 | `run_scraper_cron.py` | Automated scraper + ingestion for cron |
 | `setup_cron.sh` | Interactive cron job installer |
-| `test_connections.py` | Test OpenAI, Pinecone, PostgreSQL connections |
-| `schema.sql` | PostgreSQL database schema |
+| `test_connections.py` | Test OpenAI, Pinecone, MongoDB connections |
 | `requirements.txt` | Python dependencies |
 | `.env.template` | Environment variables template |
 
@@ -260,12 +298,13 @@ crontab -e
 OPENAI_API_KEY=sk-...
 PINECONE_API_KEY=...
 PINECONE_INDEX_NAME=ailsa-grants
-DATABASE_URL=postgresql://user:pass@host:5432/dbname
+MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net/
+MONGO_DB_NAME=ailsa_grants
 ```
 
 ### Customize Ingestion
 
-Edit `run_scraper_cron.py` line 174 to change what gets ingested:
+Edit `run_scraper_cron.py` line 253 to change what gets ingested:
 
 ```python
 # Ingest all grants (default)
@@ -275,15 +314,28 @@ ingestion_results = run_ingestion(grants, ingest_all=True)
 ingestion_results = run_ingestion(grants, ingest_all=False)
 ```
 
+## Testing
+
+```bash
+# Run scraper
+python3 eureka_scraper.py  # Outputs normalized grants
+
+# Ingest to MongoDB
+python3 ingest_eureka_only.py
+
+# Verify
+mongosh $MONGO_URI --eval 'use ailsa_grants; db.grants.countDocuments({source: "eureka"})'
+```
+
 ## Troubleshooting
 
 ### Connection Errors
 - Check `.env` file has correct credentials
-- Verify PostgreSQL is running and accessible
+- Verify MongoDB is accessible (check IP whitelist if using Atlas)
 - Confirm Pinecone index exists
 
 ### Missing Data
-- Some grants may show "Unknown" status if dates couldn't be parsed
+- Some grants may show "unknown" status if dates couldn't be parsed
 - Grants will still be ingested with available data
 
 ### Cron Job Not Running
@@ -306,7 +358,7 @@ grep CRON /var/log/syslog
 
 ### Re-running Ingestion
 
-Safe to run multiple times - uses `ON CONFLICT` to update existing records.
+Safe to run multiple times - uses upsert to update existing records.
 
 ## Advanced Usage
 
@@ -329,7 +381,7 @@ def send_slack_notification(summary):
     webhook_url = os.getenv("SLACK_WEBHOOK_URL")
     if webhook_url:
         requests.post(webhook_url, json={
-            "text": f"Eureka scraper: {summary['ingestion']['postgres_success']} grants ingested"
+            "text": f"Eureka scraper: {summary['ingestion']['mongo_success']} grants ingested"
         })
 ```
 
@@ -355,7 +407,7 @@ run_ingestion(open_grants)
   - 31 closed
   - 0 upcoming
 - 100% date extraction coverage
-- 100% PostgreSQL success
+- 100% MongoDB success
 - 100% Pinecone indexing success
 
 ## Best Practices
