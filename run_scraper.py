@@ -9,8 +9,11 @@ if __name__ == "__main__":
     scraper = EurekaNetworkScraper()
     grants = scraper.scrape_all()
 
-    # Ingest to MongoDB + Pinecone
+    # Save to normalized.json
     if grants:
+        scraper.save_normalized_json(grants)
+
+        # Ingest to MongoDB + Pinecone
         ingest_eureka_grants(grants)
     else:
         print("No grants found to ingest")

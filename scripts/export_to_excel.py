@@ -19,7 +19,13 @@ except ImportError:
     from openpyxl.styles import Font, Alignment, PatternFill
     from openpyxl.utils import get_column_letter
 
-from eureka_scraper import EurekaNetworkScraper
+import sys
+from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.scraper import EurekaNetworkScraper
 
 
 def export_to_excel(grants: list, output_path: str = "scraper_results.xlsx"):
@@ -126,11 +132,16 @@ def main():
     # Export to Excel
     print()
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    excel_path = f"scraper_results_{timestamp}.xlsx"
-    export_to_excel(grants, excel_path)
+
+    # Create output directory
+    output_dir = Path(__file__).parent.parent / "outputs" / "excel"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    excel_path = output_dir / f"scraper_results_{timestamp}.xlsx"
+    export_to_excel(grants, str(excel_path))
 
     # Also save JSON for reference
-    json_path = f"scraper_results_{timestamp}.json"
+    json_path = output_dir / f"scraper_results_{timestamp}.json"
     with open(json_path, 'w') as f:
         json.dump(grants, f, indent=2)
     print(f"Saved JSON to {json_path}")

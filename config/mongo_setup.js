@@ -1,21 +1,21 @@
 /**
- * MongoDB Setup for NIHR + Innovate UK Grant Scrapers
+ * MongoDB Setup for Eureka Network Grant Scraper
  *
- * This script creates the shared grants collection and indexes.
- * Can be used by both NIHR and Innovate UK scrapers.
+ * This script creates the grants collection and indexes.
+ * Used by the Eureka Network scraper for the Ailsa grants platform.
  *
  * Usage:
- *   mongosh "$MONGO_URI" < mongo_setup.js
+ *   mongosh "$MONGO_URI" < config/mongo_setup.js
  *
  * Or interactively:
  *   mongosh "$MONGO_URI"
- *   > load("mongo_setup.js")
+ *   > load("config/mongo_setup.js")
  */
 
 // Switch to the grants database
 use ailsa_grants;
 
-print("Setting up grants collection for NIHR + Innovate UK scrapers...\n");
+print("Setting up grants collection for Eureka Network scraper...\n");
 
 // Create indexes for the grants collection
 print("Creating indexes...");
@@ -27,7 +27,7 @@ db.grants.createIndex(
 );
 print("  - Created unique index on grant_id");
 
-// Source index for filtering by scraper source (nihr, innovate_uk)
+// Source index for filtering by scraper source (eureka, nihr, innovate_uk, etc.)
 db.grants.createIndex(
     { "source": 1 },
     { name: "idx_source" }
@@ -102,8 +102,7 @@ print("\n========================================");
 print("MongoDB setup complete!");
 print("========================================");
 print("\nThe grants collection is now ready for use by:");
-print("  - NIHR scraper (source: 'nihr')");
-print("  - Innovate UK scraper (source: 'innovate_uk')");
+print("  - Eureka Network scraper (source: 'eureka')");
 print("\nTest with:");
-print("  db.grants.findOne({source: 'nihr'})");
-print("  db.grants.countDocuments({source: 'nihr', status: 'active'})");
+print("  db.grants.findOne({source: 'eureka'})");
+print("  db.grants.countDocuments({source: 'eureka', status: 'open'})");
