@@ -20,8 +20,8 @@ from pinecone import Pinecone
 from dotenv import load_dotenv
 
 # Import scraper and ingestion functions
-from eureka_scraper import EurekaNetworkScraper
-from ingest_eureka_only import (
+from src.scraper import EurekaNetworkScraper
+from src.ingest import (
     normalize_eureka_grant,
     extract_embedding_text,
     create_embedding,
@@ -37,7 +37,7 @@ PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "ailsa-grants")
 MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "ailsa_grants")
-LOG_DIR = Path("logs")
+LOG_DIR = Path("outputs/logs")
 DATA_DIR = Path("data/eureka_network")
 
 # Create directories

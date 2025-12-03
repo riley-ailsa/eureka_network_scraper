@@ -12,13 +12,13 @@ venv/
 ENV/
 *.egg-info/
 
-# Logs
+# Outputs
+outputs/
 *.log
-output.log
-scraper.log
 
 # Data files
-data/
+data/raw/
+data/processed/
 
 # IDE
 .vscode/
@@ -30,3 +30,6 @@ data/
 # OS
 .DS_Store
 Thumbs.db
+
+# Environment
+.env.local

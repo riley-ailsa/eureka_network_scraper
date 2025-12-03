@@ -7,7 +7,6 @@ WORKDIR /app
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     cron \
-    postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
@@ -15,20 +14,20 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
-COPY eureka_scraper.py .
-COPY ingest_eureka_only.py .
-COPY run_scraper_cron.py .
-COPY test_connections.py .
-COPY schema.sql .
+COPY src/ ./src/
+COPY scripts/ ./scripts/
+COPY config/ ./config/
+COPY cron_job.py .
+COPY run_scraper.py .
 
 # Create necessary directories
-RUN mkdir -p data/eureka_network logs
+RUN mkdir -p data/eureka_network outputs/logs outputs/excel
 
 # Make scripts executable
-RUN chmod +x run_scraper_cron.py
+RUN chmod +x cron_job.py run_scraper.py scripts/setup_cron.sh
 
 # Set environment variables (will be overridden by docker-compose or runtime)
 ENV PYTHONUNBUFFERED=1
 
 # Default command - run the scraper once
-CMD ["python3", "run_scraper_cron.py"]
+CMD ["python3", "cron_job.py"]

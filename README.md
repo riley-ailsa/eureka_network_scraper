@@ -1,12 +1,44 @@
 # Eureka Network Scraper
 
-Automated scraper and ingestion pipeline for Eureka Network funding opportunities.
+Scrapes funding opportunities from Eureka Network for Ailsa grant discovery platform.
 
-## Overview
+## Project Structure
 
-Scrapes grant data from the Eureka Network website (https://www.eurekanetwork.org/programmes-and-calls/) and ingests it into MongoDB + Pinecone with OpenAI embeddings. Includes automated scheduling via cron jobs.
+```
+src/          - Source code (scraper, ingestion)
+scripts/      - Utility scripts (testing, exports)
+config/       - Database schemas and setup
+outputs/      - Generated files (Excel, logs)
+data/         - Scraped data storage
+docs/         - Documentation
+```
 
-## Features
+## Quick Start
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Configure environment
+cp .env.example .env
+# Edit .env with your MongoDB URI
+
+# Run scraper
+python run_scraper.py
+
+# Export to Excel for review
+python scripts/export_to_excel.py
+```
+
+## Deployment
+
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for production deployment instructions.
+
+---
+
+## Detailed Documentation
+
+### Features
 
 - **Comprehensive scraping** - All open, closed, and upcoming grants
 - **Structured content extraction** - About, eligibility, funding by country, application instructions, key dates
@@ -16,9 +48,7 @@ Scrapes grant data from the Eureka Network website (https://www.eurekanetwork.or
 - **Cron scheduling** - Set it and forget it with automated runs
 - **Detailed logging** - Track success/failures with timestamped logs and JSON summaries
 
-## Quick Start
-
-### 1. Installation
+### Installation
 
 ```bash
 # Clone or navigate to this directory
@@ -37,38 +67,33 @@ cp .env.template .env
 # - MONGO_DB_NAME (default: ailsa_grants)
 ```
 
-### 2. Test Connections
+### Test Connections
 
 ```bash
-python test_connections.py
+python scripts/test_connections.py
 ```
 
 Make sure all three connections pass (OpenAI, Pinecone, MongoDB)
 
-### 3. Run Scraper + Ingestion
+### Run Scraper + Ingestion
 
-**Option A: Manual run (interactive)**
+**Option A: Simple run**
 
 ```bash
-# Step 1: Scrape grants
-python eureka_scraper.py
-
-# Step 2: Ingest to databases (you'll choose what to ingest)
-python ingest_eureka_only.py
+python run_scraper.py
 ```
 
-**Option B: Automated run (non-interactive)**
+**Option B: Automated cron run (with logging)**
 
 ```bash
-# Scrape + ingest everything automatically
-python run_scraper_cron.py
+python cron_job.py
 ```
 
 **Option C: Set up cron job (fully automated)**
 
 ```bash
-chmod +x setup_cron.sh
-./setup_cron.sh
+chmod +x scripts/setup_cron.sh
+./scripts/setup_cron.sh
 # Choose schedule: daily, weekly, monthly, or custom
 ```
 
@@ -201,7 +226,7 @@ primary_grants = [g for g in data if not g.get('is_supplemental', False)]
 ### Setup
 
 ```bash
-./setup_cron.sh
+./scripts/setup_cron.sh
 ```
 
 Choose your schedule:
@@ -226,9 +251,9 @@ Choose your schedule:
    - Indexes embeddings in Pinecone
 
 3. Logging & Monitoring
-   - Detailed log: logs/cron_YYYYMMDD_HHMMSS.log
-   - Run summary: logs/summary_YYYYMMDD_HHMMSS.json
-   - Latest run: logs/latest_run.json
+   - Detailed log: outputs/logs/cron_YYYYMMDD_HHMMSS.log
+   - Run summary: outputs/logs/summary_YYYYMMDD_HHMMSS.json
+   - Latest run: outputs/logs/latest_run.json
 ```
 
 **Typical runtime:** 3-7 minutes per run
@@ -237,10 +262,10 @@ Choose your schedule:
 
 ```bash
 # Check latest run status
-cat logs/latest_run.json
+cat outputs/logs/latest_run.json
 
 # View live logs
-tail -f logs/cron_output.log
+tail -f outputs/logs/cron_output.log
 
 # List installed cron jobs
 crontab -l
@@ -261,7 +286,7 @@ Example summary output:
     "failed": 0
   },
   "elapsed_seconds": 125.3,
-  "log_file": "logs/cron_20251120_153000.log"
+  "log_file": "outputs/logs/cron_20251120_153000.log"
 }
 ```
 
@@ -282,13 +307,15 @@ crontab -e
 
 | File | Purpose |
 |------|---------|
-| `eureka_scraper.py` | Main scraper - extracts all grant data |
-| `ingest_eureka_only.py` | Ingestion script (interactive) |
-| `run_scraper_cron.py` | Automated scraper + ingestion for cron |
-| `setup_cron.sh` | Interactive cron job installer |
-| `test_connections.py` | Test OpenAI, Pinecone, MongoDB connections |
+| `run_scraper.py` | Main entry point - scrapes and ingests |
+| `cron_job.py` | Automated scraper + ingestion for cron |
+| `src/scraper.py` | Core scraper - extracts all grant data |
+| `src/ingest.py` | MongoDB + Pinecone ingestion |
+| `scripts/setup_cron.sh` | Interactive cron job installer |
+| `scripts/test_connections.py` | Test OpenAI, Pinecone, MongoDB connections |
+| `scripts/export_to_excel.py` | Export grants to Excel for review |
+| `config/mongo_setup.js` | MongoDB setup script |
 | `requirements.txt` | Python dependencies |
-| `.env.template` | Environment variables template |
 
 ## Configuration
 
@@ -304,7 +331,7 @@ MONGO_DB_NAME=ailsa_grants
 
 ### Customize Ingestion
 
-Edit `run_scraper_cron.py` line 253 to change what gets ingested:
+Edit `cron_job.py` line 253 to change what gets ingested:
 
 ```python
 # Ingest all grants (default)
@@ -317,11 +344,8 @@ ingestion_results = run_ingestion(grants, ingest_all=False)
 ## Testing
 
 ```bash
-# Run scraper
-python3 eureka_scraper.py  # Outputs normalized grants
-
-# Ingest to MongoDB
-python3 ingest_eureka_only.py
+# Run scraper + ingest
+python run_scraper.py
 
 # Verify
 mongosh $MONGO_URI --eval 'use ailsa_grants; db.grants.countDocuments({source: "eureka"})'
@@ -372,7 +396,7 @@ MAILTO=your-email@example.com
 
 ### Slack/Discord Webhooks
 
-Add to `run_scraper_cron.py`:
+Add to `cron_job.py`:
 
 ```python
 import requests
@@ -389,7 +413,7 @@ def send_slack_notification(summary):
 
 ```python
 # custom_run.py
-from run_scraper_cron import run_scraper, run_ingestion
+from cron_job import run_scraper, run_ingestion
 
 grants = run_scraper()
 

@@ -4,6 +4,7 @@ Ingest Eureka Network grants into MongoDB + Pinecone.
 Converts scraped grant data to MongoDB document format with OpenAI embeddings.
 """
 
+import argparse
 import json
 import os
 import sys
@@ -403,18 +404,16 @@ def main():
     print(f"   - Primary R&D grants: {len(primary)}")
     print(f"   - Supplemental (Investment Readiness): {len(supplemental)}")
 
-    # Ask user what to ingest
-    print("\nWhat would you like to ingest?")
-    print(f"1. All grants ({len(grants)} total)")
-    print(f"2. Primary R&D grants only ({len(primary)} grants)")
-    print(f"3. Supplemental opportunities only ({len(supplemental)} grants)")
+    # Parse CLI arguments for grant type selection
+    parser = argparse.ArgumentParser(description='Ingest Eureka Network grants into MongoDB + Pinecone')
+    parser.add_argument('--type', choices=['all', 'primary', 'supplemental'], default='all',
+                        help='Type of grants to ingest: all, primary (R&D), or supplemental (Investment Readiness)')
+    args = parser.parse_args()
 
-    choice = input("\nEnter choice (1-3) [default: 1]: ").strip() or "1"
-
-    if choice == "2":
+    if args.type == 'primary':
         grants_to_ingest = primary
         print(f"\nIngesting {len(grants_to_ingest)} primary R&D grants")
-    elif choice == "3":
+    elif args.type == 'supplemental':
         grants_to_ingest = supplemental
         print(f"\nIngesting {len(grants_to_ingest)} supplemental opportunities")
     else:

@@ -219,6 +219,10 @@ class EurekaNetworkScraper:
             # Extract funding info (summary)
             funding_info = self._extract_funding_info(soup)
 
+            # Add currency context based on title/URL
+            if funding_info:
+                funding_info = self._add_currency_context(funding_info, title, url)
+
             # Determine status
             status = self._determine_status(close_date)
 
@@ -461,24 +465,164 @@ class EurekaNetworkScraper:
         return open_date, close_date
 
     def _extract_funding_info(self, soup: BeautifulSoup) -> str:
-        """Extract funding amount/information."""
+        """
+        Extract funding amount with intelligent context-aware matching.
+
+        Strategy:
+        1. Look for high-confidence patterns (currency symbol + amount + scale)
+        2. Look in funding-specific sections
+        3. Validate extracted amounts (reject obvious errors)
+        4. Return empty if nothing valid found
+        """
         text = soup.get_text()
 
-        # Look for funding amounts - more patterns
-        funding_patterns = [
-            r'grants of ([\d,]+\s*euro)',
-            r'up to ([€$£]\s*[\d,]+(?:\s*(?:million|k|thousand))?)',
-            r'maximum of ([€$£]?\s*[\d,]+(?:\s*(?:Canadian dollars|euro|EUR|CAD|dollars))?)',
-            r'([€$£]\s*[\d,]+(?:\s*(?:million|k|thousand))?)\s+(?:available|funding)',
-            r'([\d,]+\s*(?:euro|EUR|dollars|CAD))',
+        # Pattern 1: Full explicit patterns (highest confidence)
+        # These require funding keywords AND complete amount
+        explicit_patterns = [
+            # "maximum of 500,000 euro" or "maximum of €500,000"
+            r'(?:maximum of|up to|grants? of|funding of|budget of|award of)\s+([€$£]\s*[\d,]+(?:\s+(?:million|thousand))?|\d{1,3}(?:,\d{3})*\s+(?:euro|EUR|dollars|CAD))',
+
+            # "€3 million" or "$500,000" with scale word
+            r'([€$£]\s*[\d,]+(?:\.\d+)?\s+(?:million|thousand|k))\b',
+
+            # Large amounts with currency symbol (€500,000 or $3,425,000)
+            r'([€$£]\s*\d{1,3}(?:,\d{3})+)\b',
         ]
 
-        for pattern in funding_patterns:
+        for pattern in explicit_patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                return match.group(0)
+                amount = match.group(1) if match.lastindex else match.group(0)
+                amount = amount.strip()
 
+                # Validate: Must be reasonable
+                if self._is_valid_amount(amount):
+                    return amount
+
+        # Pattern 2: Look in dedicated funding section
+        # More permissive since we know we're in the right context
+        funding_section = soup.find(string=re.compile(r'funding\s+(?:information|details|available)', re.IGNORECASE))
+        if funding_section:
+            parent = funding_section.find_parent()
+            if parent:
+                section_text = parent.get_text()[:500]  # Limit to nearby text
+
+                # In funding section, accept amounts with clear markers
+                section_patterns = [
+                    r'([€$£]\s*[\d,]+(?:\s+(?:million|thousand|k|euro|EUR|dollars|CAD))?)',
+                    r'([\d,]+\s+(?:euro|EUR|dollars|CAD))\b',
+                ]
+
+                for pattern in section_patterns:
+                    match = re.search(pattern, section_text, re.IGNORECASE)
+                    if match:
+                        amount = match.group(1).strip()
+                        if self._is_valid_amount(amount):
+                            return amount
+
+        # Pattern 3: Fallback to conservative match anywhere
+        # Only accept if it has currency symbol AND reasonable number
+        conservative_pattern = r'([€$£]\s*\d{1,3}(?:,\d{3})+(?:\s+(?:million|thousand|euro|EUR))?)'
+        match = re.search(conservative_pattern, text, re.IGNORECASE)
+        if match:
+            amount = match.group(1).strip()
+            if self._is_valid_amount(amount):
+                return amount
+
+        # No valid funding found
         return ""
+
+    def _is_valid_amount(self, amount: str) -> bool:
+        """
+        Validate that extracted amount looks like real funding.
+
+        Rejects:
+        - Single digit amounts (€1, €5, etc.)
+        - Just punctuation
+        - Amounts that look like dates
+        """
+        amount = amount.strip()
+
+        # Must have some content
+        if not amount or len(amount) < 2:
+            return False
+
+        # Extract numeric part
+        numeric = re.findall(r'\d+', amount)
+        if not numeric:
+            return False
+
+        first_number = int(numeric[0])
+
+        # Reject single-digit amounts unless they have "million" or "thousand"
+        if first_number < 10 and not re.search(r'million|thousand|k\b', amount, re.IGNORECASE):
+            return False
+
+        # Reject if looks like a year (2023, 2024, 2025, etc.)
+        if re.match(r'^20\d{2}', amount.strip()):
+            return False
+
+        # Reject amounts that are suspiciously small without scale words
+        # e.g., "maximum of 60" is probably "60,000" but we caught it incomplete
+        if first_number < 1000 and ',' not in amount and not re.search(r'million|thousand|k\b', amount, re.IGNORECASE):
+            # Unless it has a currency symbol AND is at least 3 digits
+            if not (re.search(r'[€$£]', amount) and first_number >= 100):
+                return False
+
+        return True
+
+    def _add_currency_context(self, funding: str, title: str, url: str) -> str:
+        """
+        Add currency code to funding amount based on context.
+
+        For grants involving specific countries, infer the currency:
+        - Chile → CLP
+        - Canada → CAD
+        - Singapore → SGD
+        - Japan → JPY
+
+        Args:
+            funding: Raw funding amount (e.g., "$220 million")
+            title: Grant title
+            url: Grant URL
+
+        Returns:
+            Funding with currency code (e.g., "$220 million CLP")
+        """
+        if not funding:
+            return funding
+
+        # Check if currency code already present
+        if any(code in funding.upper() for code in ['CLP', 'CAD', 'USD', 'EUR', 'GBP', 'SGD', 'JPY', 'AUD']):
+            return funding
+
+        # Check if full currency name already present
+        if any(name in funding.lower() for name in ['chilean peso', 'canadian dollar', 'euro', 'pound sterling']):
+            return funding
+
+        # Country-specific currency mapping
+        country_currency_map = {
+            'chile': 'CLP',
+            'chilean': 'CLP',
+            'canada': 'CAD',
+            'canadian': 'CAD',
+            'singapore': 'SGD',
+            'japan': 'JPY',
+            'japanese': 'JPY',
+            'australia': 'AUD',
+            'australian': 'AUD',
+            'new zealand': 'NZD',
+        }
+
+        # Check title and URL for country mentions
+        text_to_check = (title + ' ' + url).lower()
+
+        for country, currency in country_currency_map.items():
+            if country in text_to_check:
+                # Add currency code after the amount
+                return f"{funding} ({currency})"
+
+        return funding
 
     def _determine_status(self, close_date: Optional[datetime]) -> str:
         """Determine if grant is open or closed based on deadline."""
@@ -504,7 +648,7 @@ class EurekaNetworkScraper:
     def _extract_programme(self, soup: BeautifulSoup, url: str) -> Optional[str]:
         """Extract programme type from URL or breadcrumbs."""
         # Try to extract from URL
-        if '/network-projects/' in url:
+        if '/network-projects/' in url or 'network-projects-' in url:
             return "Network Projects"
         elif '/eurostars/' in url:
             return "Eurostars"
@@ -514,6 +658,27 @@ class EurekaNetworkScraper:
             return "Eureka Clusters"
         elif '/innowwide/' in url:
             return "Innowwide"
+        elif '/investment-readiness/' in url:
+            return "Investment Readiness"
+        elif '/fast-track-to-the-eic-accelerator/' in url:
+            return "Fast Track to EIC Accelerator"
+
+        # Check title for programme hints
+        title_elem = soup.find('h1')
+        if title_elem:
+            title = title_elem.get_text().lower()
+            if 'eurostars' in title:
+                return "Eurostars"
+            elif 'globalstars' in title:
+                return "Globalstars"
+            elif 'innowwide' in title:
+                return "Innowwide"
+            elif 'cluster' in title or 'celtic' in title or 'smart' in title or 'xecs' in title or 'itea' in title or 'eurogia' in title:
+                return "Eureka Clusters"
+            elif 'corporate' in title or 'challenge' in title:
+                return "Corporate Partnerships"
+            elif 'network project' in title:
+                return "Network Projects"
 
         # Try breadcrumbs
         breadcrumbs = soup.find_all('a', class_=re.compile('breadcrumb'))

@@ -9,15 +9,15 @@ services:
     volumes:
       # Persist scraped data
       - ./data:/app/data
-      # Persist logs
-      - ./logs:/app/logs
+      # Persist outputs (logs, excel exports)
+      - ./outputs:/app/outputs
     restart: unless-stopped
     # Run on a schedule using cron-like syntax
     # Uncomment and modify the command below to run on a schedule
     # command: >
     #   sh -c "
     #   while true; do
-    #     python3 run_scraper_cron.py;
+    #     python3 cron_job.py;
     #     sleep 86400;
     #   done
     #   "
